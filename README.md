@@ -425,4 +425,3 @@ The integrated wrapper must keep **one operation arbiter**, **one wait-state own
 - Intel, [PIPE specification overview](https://www.intel.com/content/www/us/en/io/pci-express/phy-interface-pci-express-sata-usb30-architectures-3-1.html). PIPE defines the MAC–PHY interface; the PCIe Base specification takes precedence where requirements conflict.
 - PCI-SIG, [PCI Express Base specification overview](https://pcisig.com/specification-overview/pci-express-base), for link and LTSSM requirements.
 
-This README was prepared from the displayed chapter filenames and the supplied `pcie_pipe_mac_if_v3` implementation. The chapter bodies themselves were not attached with the screenshot. Align their detailed prose and examples with this index before publishing the complete course package.
