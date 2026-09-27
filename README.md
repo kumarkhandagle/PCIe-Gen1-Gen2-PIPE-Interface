@@ -1,1 +1,5 @@
 # PCIe-PIPE
+
+A PCIe link depends on close coordination between the MAC and the PHY. The PIPE interface carries data between them and lets the MAC request PHY operations such as power state changes, electrical idle, rate changes, receiver detection, and loopback. Understanding the signals individually is straightforward; understanding when to assert them, what to wait for, and how they relate to LTSSM states takes more work.
+This course teaches those control sequences through a hands-on Gen1/Gen2, single-lane Verilog project. You will build separate RTL blocks for P0/P0s/P1 power control, transmit and receive electrical idle, rate changes, receiver detection, and loopback. You will then connect them into a PIPE controller and study how requests, PhyStatus, RxStatus, and completion signals work together.
+By the end, you will be able to read a PIPE timing sequence and explain what the MAC requests, what the PHY performs, and what the LTSSM must confirm before moving on. The course focuses on the MAC–PHY control interface; it does not claim to build a complete PCIe controller or analog PHY.
