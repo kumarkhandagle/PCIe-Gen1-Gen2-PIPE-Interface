@@ -1,0 +1,191 @@
+`timescale 1ns/1ps
+
+// Standalone Gen1/Gen2 PIPE rate-change controller extracted from
+// pcie_pipe_mac_if_v3. The LTSSM prepares electrical idle and, for P0,
+// receiver standby before requesting a new rate. This module does not
+// generate EIOS, change PowerDown, or qualify received TS1/TS2.
+//
+// The full wrapper serializes this operation with power-state changes and
+// receiver detection. Here rate change is the only PHY operation.
+module pcie_pipe_rate_change_controller #(
+    parameter integer PHY_TIMEOUT_CYCLES = 4096
+) (
+    input  wire       pclk,
+    input  wire       reset_n,
+
+    // Current PIPE power state and registered transmitter idle command.
+    input  wire [1:0] PowerDown,
+    input  wire       TxElecIdle,
+    input  wire       loopback_mode,
+
+    // MAC/LTSSM commands: Rate 0=Gen1, 1=Gen2.
+    input  wire       mac_rate,
+    input  wire       mac_rx_standby,
+    input  wire       mac_tx_deemph,
+
+    // PHY acknowledgments/status.
+    input  wire       RxStandbyStatus,
+    input  wire       PhyStatus,
+
+    // PIPE commands to PHY.
+    output reg        Rate,
+    output reg        RxStandby,
+    output reg        TxDeemph,
+
+    // MAC-facing status. rate_done is a one-PCLK pulse.
+    output wire       mac_rx_standby_status,
+    output reg        rate_done,
+    output wire       rate_busy,
+    output wire       phy_initialized,
+    output reg        phy_timeout,
+    output wire       request_blocked,
+    output reg  [2:0] request_blocked_reason
+);
+
+    localparam [1:0] P0  = 2'b00;
+    localparam [1:0] P1  = 2'b10;
+
+    localparam [1:0] ST_RESET = 2'd0;
+    localparam [1:0] ST_IDLE  = 2'd1;
+    localparam [1:0] ST_WAIT  = 2'd2;
+    localparam [1:0] ST_FAULT = 2'd3;
+
+    // Numeric reason values match the original shared wrapper.
+    localparam [2:0] BLK_NONE            = 3'd0;
+    localparam [2:0] BLK_TX_NOT_IDLE     = 3'd2;
+    localparam [2:0] BLK_WRONG_PWR_STATE = 3'd3;
+    localparam [2:0] BLK_LOOPBACK        = 3'd4;
+    localparam [2:0] BLK_RX_NOT_STANDBY  = 3'd5;
+
+    reg [1:0]  state;
+    reg [31:0] timeout_counter;
+
+    wire rate_change_needed;
+    wire rate_change_allowed;
+    wire start_rate_operation;
+    wire finish_rate_operation;
+    wire rate_operation_timed_out;
+
+    assign mac_rx_standby_status = RxStandbyStatus;
+    assign rate_change_needed = (mac_rate != Rate);
+
+    // P0 and P1 are allowed. TX must already be electrically idle. A
+    // P0 rate change additionally requires the PHY's RX standby response.
+    assign rate_change_allowed =
+        ((PowerDown == P0) || (PowerDown == P1)) &&
+        TxElecIdle &&
+        ((PowerDown != P0) || (RxStandby && RxStandbyStatus)) &&
+        !loopback_mode;
+
+    assign start_rate_operation =
+        (state == ST_IDLE) &&
+        rate_change_needed &&
+        rate_change_allowed;
+
+    assign finish_rate_operation = (state == ST_WAIT) && PhyStatus;
+
+    // PhyStatus wins when it coincides with the timeout threshold.
+    assign rate_operation_timed_out =
+        (state == ST_WAIT) &&
+        !PhyStatus &&
+        (timeout_counter >= (PHY_TIMEOUT_CYCLES - 1));
+
+    assign rate_busy = (state == ST_WAIT) || start_rate_operation;
+    assign phy_initialized = (state == ST_IDLE) || (state == ST_WAIT);
+    assign request_blocked = (request_blocked_reason != BLK_NONE);
+
+    always @* begin
+        request_blocked_reason = BLK_NONE;
+
+        if ((state == ST_IDLE) &&
+            rate_change_needed &&
+            !rate_change_allowed) begin
+            if (loopback_mode)
+                request_blocked_reason = BLK_LOOPBACK;
+            else if ((PowerDown != P0) && (PowerDown != P1))
+                request_blocked_reason = BLK_WRONG_PWR_STATE;
+            else if (!TxElecIdle)
+                request_blocked_reason = BLK_TX_NOT_IDLE;
+            else
+                request_blocked_reason = BLK_RX_NOT_STANDBY;
+        end
+    end
+
+    // The MAC owns the standby request. Hold its registered PIPE command
+    // during launch and while the PHY is processing the rate change.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n)
+            RxStandby <= 1'b0;
+        else if ((state == ST_IDLE) && !start_rate_operation)
+            RxStandby <= mac_rx_standby;
+    end
+
+    // Preserve the full wrapper's update timing: on the launch edge,
+    // select de-emphasis using the requested rate. Otherwise update while
+    // TX is idle using the currently commanded Rate. Gen1 forces 1.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            TxDeemph <= 1'b1;
+        end else if (TxElecIdle) begin
+            if (start_rate_operation)
+                TxDeemph <= mac_rate ? mac_tx_deemph : 1'b1;
+            else
+                TxDeemph <= Rate ? mac_tx_deemph : 1'b1;
+        end
+    end
+
+    // Rate changes on the launch edge; rate_done follows a subsequent
+    // PhyStatus acknowledgment. That pulse reports local PHY completion.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            state           <= ST_RESET;
+            Rate            <= 1'b0;
+            rate_done       <= 1'b0;
+            phy_timeout     <= 1'b0;
+            timeout_counter <= 32'd0;
+        end else begin
+            rate_done <= 1'b0;
+
+            case (state)
+                ST_RESET: begin
+                    // Source wrapper assumption: sampled low means ready.
+                    if (!PhyStatus)
+                        state <= ST_IDLE;
+                end
+
+                ST_IDLE: begin
+                    timeout_counter <= 32'd0;
+                    if (start_rate_operation) begin
+                        Rate <= mac_rate;
+                        state <= ST_WAIT;
+                    end
+                end
+
+                ST_WAIT: begin
+                    if (finish_rate_operation) begin
+                        rate_done <= 1'b1;
+                        timeout_counter <= 32'd0;
+                        state <= ST_IDLE;
+                    end else if (rate_operation_timed_out) begin
+                        phy_timeout <= 1'b1;
+                        state <= ST_FAULT;
+                    end else begin
+                        timeout_counter <= timeout_counter + 32'd1;
+                    end
+                end
+
+                ST_FAULT: state <= ST_FAULT; // Reset is the only recovery.
+
+                default: state <= ST_FAULT;
+            endcase
+        end
+    end
+
+    initial begin
+        if (PHY_TIMEOUT_CYCLES < 1) begin
+            $display("FATAL: PHY_TIMEOUT_CYCLES must be at least 1");
+            $finish;
+        end
+    end
+
+endmodule

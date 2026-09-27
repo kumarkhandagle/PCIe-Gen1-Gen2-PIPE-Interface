@@ -1,0 +1,211 @@
+`timescale 1ns/1ps
+
+// Standalone Gen1/Gen2 PIPE receiver-detection controller extracted from
+// pcie_pipe_mac_if_v3. The LTSSM requests detection only after arranging
+// P1 and TX electrical idle; the PHY performs the electrical measurement.
+//
+// In the full wrapper, TxDetectRx has one shared owner because the signal
+// also requests PHY loopback in P0. This independent module drives it only
+// for receiver detection in P1 and must be arbitrated when integrated.
+module pcie_pipe_receiver_detection #(
+    parameter integer PHY_TIMEOUT_CYCLES = 4096
+) (
+    input  wire       pclk,
+    input  wire       reset_n,
+
+    // Status/control from the surrounding PIPE controller.
+    input  wire [1:0] PowerDown,
+    input  wire       TxElecIdle,
+    input  wire       loopback_mode,
+
+    // LTSSM request: hold high until detect_done. Deassertion before
+    // launch cancels a pending request; once launched, it runs to completion.
+    input  wire       mac_detect_req,
+
+    // PHY completion and result.
+    input  wire       PhyStatus,
+    input  wire [2:0] RxStatus,
+
+    // PIPE command to PHY.
+    output reg        TxDetectRx,
+
+    // MAC/LTSSM result. detect_done is a one-PCLK pulse; the result is held.
+    output reg        detect_done,
+    output reg        detect_rx_present,
+    output wire       detect_busy,
+    output wire       phy_initialized,
+    output reg        phy_timeout,
+    output wire       request_blocked,
+    output reg  [2:0] request_blocked_reason
+);
+
+    localparam [1:0] P1 = 2'b10;
+    localparam [2:0] RXST_RX_DETECTED = 3'b011;
+
+    localparam [1:0] ST_RESET = 2'd0;
+    localparam [1:0] ST_IDLE  = 2'd1;
+    localparam [1:0] ST_WAIT  = 2'd2;
+    localparam [1:0] ST_FAULT = 2'd3;
+
+    // Numeric reason values match the original shared wrapper.
+    localparam [2:0] BLK_NONE            = 3'd0;
+    localparam [2:0] BLK_TX_NOT_IDLE     = 3'd2;
+    localparam [2:0] BLK_WRONG_PWR_STATE = 3'd3;
+    localparam [2:0] BLK_LOOPBACK        = 3'd4;
+
+    reg [1:0]  state;
+    reg [31:0] timeout_counter;
+    reg        detect_req_delayed;
+    reg        detect_pending;
+
+    wire detect_req_rising;
+    wire detect_allowed;
+    wire start_detect_operation;
+    wire finish_detect_operation;
+    wire detect_operation_timed_out;
+
+    assign detect_req_rising = mac_detect_req && !detect_req_delayed;
+
+    // Detection is not an automatic transition to P1. Its caller prepares
+    // PowerDown=P1 and a registered TxElecIdle=1 before launch.
+    assign detect_allowed =
+        (PowerDown == P1) &&
+        TxElecIdle &&
+        !loopback_mode;
+
+    assign start_detect_operation =
+        (state == ST_IDLE) &&
+        detect_pending &&
+        mac_detect_req &&
+        detect_allowed;
+
+    assign finish_detect_operation = (state == ST_WAIT) && PhyStatus;
+
+    // A PhyStatus acknowledgment wins at the timeout threshold.
+    assign detect_operation_timed_out =
+        (state == ST_WAIT) &&
+        !PhyStatus &&
+        (timeout_counter >= (PHY_TIMEOUT_CYCLES - 1));
+
+    assign detect_busy = (state == ST_WAIT) || start_detect_operation;
+    assign phy_initialized = (state == ST_IDLE) || (state == ST_WAIT);
+    assign request_blocked = (request_blocked_reason != BLK_NONE);
+
+    // Keep a held request while busy; a pulse that disappears before
+    // launch is canceled. No new detection starts merely because a request
+    // stays high after its completion: a fresh rising edge is required.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            detect_req_delayed <= 1'b0;
+            detect_pending     <= 1'b0;
+        end else begin
+            detect_req_delayed <= mac_detect_req;
+
+            if (detect_req_rising)
+                detect_pending <= 1'b1;
+            else if (!mac_detect_req)
+                detect_pending <= 1'b0;
+
+            if (start_detect_operation)
+                detect_pending <= detect_req_rising;
+
+            if (state == ST_FAULT)
+                detect_pending <= 1'b0;
+        end
+    end
+
+    always @* begin
+        request_blocked_reason = BLK_NONE;
+
+        if ((state == ST_IDLE) &&
+            detect_pending &&
+            mac_detect_req &&
+            !detect_allowed) begin
+            if (loopback_mode)
+                request_blocked_reason = BLK_LOOPBACK;
+            else if (PowerDown != P1)
+                request_blocked_reason = BLK_WRONG_PWR_STATE;
+            else
+                request_blocked_reason = BLK_TX_NOT_IDLE;
+        end
+    end
+
+    // Only RxStatus=3'b011 reports receiver present. As in the source
+    // wrapper, every other code is captured as a false result.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            detect_done       <= 1'b0;
+            detect_rx_present <= 1'b0;
+        end else begin
+            detect_done <= 1'b0;
+
+            if (finish_detect_operation) begin
+                detect_rx_present <= (RxStatus == RXST_RX_DETECTED);
+                detect_done       <= 1'b1;
+            end
+        end
+    end
+
+    // Assert TxDetectRx at launch and hold it until completion or timeout.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            TxDetectRx <= 1'b0;
+        end else begin
+            case (state)
+                ST_RESET: TxDetectRx <= 1'b0;
+                ST_IDLE:  TxDetectRx <= start_detect_operation;
+                ST_WAIT: begin
+                    if (finish_detect_operation || detect_operation_timed_out)
+                        TxDetectRx <= 1'b0;
+                end
+                default: TxDetectRx <= 1'b0;
+            endcase
+        end
+    end
+
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            state           <= ST_RESET;
+            timeout_counter <= 32'd0;
+            phy_timeout     <= 1'b0;
+        end else begin
+            case (state)
+                ST_RESET: begin
+                    // Source wrapper assumption: sampled low means ready.
+                    if (!PhyStatus)
+                        state <= ST_IDLE;
+                end
+
+                ST_IDLE: begin
+                    timeout_counter <= 32'd0;
+                    if (start_detect_operation)
+                        state <= ST_WAIT;
+                end
+
+                ST_WAIT: begin
+                    if (finish_detect_operation) begin
+                        timeout_counter <= 32'd0;
+                        state <= ST_IDLE;
+                    end else if (detect_operation_timed_out) begin
+                        phy_timeout <= 1'b1;
+                        state <= ST_FAULT;
+                    end else begin
+                        timeout_counter <= timeout_counter + 32'd1;
+                    end
+                end
+
+                ST_FAULT: state <= ST_FAULT; // Reset is the only recovery.
+
+                default: state <= ST_FAULT;
+            endcase
+        end
+    end
+
+    initial begin
+        if (PHY_TIMEOUT_CYCLES < 1) begin
+            $display("FATAL: PHY_TIMEOUT_CYCLES must be at least 1");
+            $finish;
+        end
+    end
+
+endmodule

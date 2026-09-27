@@ -1,0 +1,115 @@
+`timescale 1ns/1ps
+
+// Independent Gen1/Gen2 PIPE electrical-idle logic extracted from
+// pcie_pipe_mac_if_v3. This module contains the original TX forcing/data
+// gating and RX synchronizer/filter behavior.
+//
+// The LTSSM generates EIOS through mac_tx_data/mac_tx_datak BEFORE asserting
+// mac_tx_elecidle. This module does not generate or recognize ordered sets.
+module pcie_pipe_electrical_idle #(
+    parameter integer RX_EI_FILTER_CYCLES = 32
+) (
+    input  wire       pclk,
+    input  wire       reset_n,
+
+    // The surrounding controller supplies these status/control signals.
+    input  wire       phy_initialized,
+    input  wire       phy_busy,     // High in the launch and wait cycles.
+    input  wire [1:0] PowerDown,
+
+    // MAC transmitter request and payload.
+    input  wire       mac_tx_elecidle,
+    input  wire [7:0] mac_tx_data,
+    input  wire       mac_tx_datak,
+    input  wire       mac_tx_compliance,
+
+    // PIPE transmitter outputs to the PHY.
+    output reg        TxElecIdle,
+    output reg  [7:0] TxData,
+    output reg        TxDataK,
+    output reg        TxCompliance,
+
+    // PIPE receiver indication from the PHY. May be asynchronous to PCLK.
+    input  wire       RxElecIdle,
+
+    // Synchronized and filtered indication delivered to the MAC/LTSSM.
+    output reg        mac_rx_elecidle
+);
+
+    localparam [1:0] P0 = 2'b00;
+
+    wire force_tx_idle;
+    wire effective_tx_idle;
+
+    reg       rx_ei_meta;
+    reg       rx_ei_sync;
+    reg [7:0] rx_ei_counter;
+
+    // The source wrapper forces idle before initialization, outside P0,
+    // and whenever an operation launches or waits for PHY acknowledgment.
+    assign force_tx_idle =
+        !phy_initialized ||
+        (PowerDown != P0) ||
+        phy_busy;
+
+    assign effective_tx_idle = mac_tx_elecidle || force_tx_idle;
+
+    // Registered PHY command. Data and compliance are suppressed when idle.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            TxElecIdle  <= 1'b1;
+            TxData      <= 8'h00;
+            TxDataK     <= 1'b0;
+            TxCompliance <= 1'b0;
+        end else begin
+            TxElecIdle <= effective_tx_idle;
+
+            TxCompliance <=
+                mac_tx_compliance &&
+                (PowerDown == P0) &&
+                !effective_tx_idle;
+
+            if (effective_tx_idle) begin
+                TxData  <= 8'h00;
+                TxDataK <= 1'b0;
+            end else begin
+                TxData  <= mac_tx_data;
+                TxDataK <= mac_tx_datak;
+            end
+        end
+    end
+
+    // Two synchronization stages followed by a consecutive-sample filter.
+    // A filter value of zero bypasses the filter, not the synchronizer.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            rx_ei_meta      <= 1'b1;
+            rx_ei_sync      <= 1'b1;
+            rx_ei_counter   <= 8'd0;
+            mac_rx_elecidle <= 1'b1;
+        end else begin
+            rx_ei_meta <= RxElecIdle;
+            rx_ei_sync <= rx_ei_meta;
+
+            if (rx_ei_sync == mac_rx_elecidle) begin
+                rx_ei_counter <= 8'd0;
+            end else if (RX_EI_FILTER_CYCLES == 0) begin
+                mac_rx_elecidle <= rx_ei_sync;
+                rx_ei_counter   <= 8'd0;
+            end else if (rx_ei_counter >= (RX_EI_FILTER_CYCLES - 1)) begin
+                mac_rx_elecidle <= rx_ei_sync;
+                rx_ei_counter   <= 8'd0;
+            end else begin
+                rx_ei_counter <= rx_ei_counter + 8'd1;
+            end
+        end
+    end
+
+    initial begin
+        if ((RX_EI_FILTER_CYCLES < 0) || (RX_EI_FILTER_CYCLES > 255)) begin
+            $display("FATAL: RX_EI_FILTER_CYCLES must be 0 to 255");
+            $finish;
+        end
+    end
+
+endmodule

@@ -1,0 +1,67 @@
+`timescale 1ns/1ps
+
+// Independent loopback-control lesson from pcie_pipe_mac_if_v3.
+// Gen1/Gen2, x1, P0. The LTSSM decides when to request PHY loopback;
+// this block only qualifies that local request and controls TxDetectRx.
+//
+// IMPORTANT: In the integrated wrapper, TxDetectRx has one shared owner:
+// P1 receiver detection and P0 loopback both use that PIPE signal. Do not
+// connect this output and a receiver-detection output to the same net.
+module pcie_pipe_loopback_control (
+    input  wire       pclk,
+    input  wire       reset_n,
+
+    // Shared PHY-operation controller status.
+    input  wire       controller_idle,
+    input  wire       starting_operation,
+    input  wire       operation_timed_out,
+    input  wire       controller_fault,
+
+    // MAC/LTSSM loopback request and PIPE context.
+    input  wire       mac_loopback,
+    input  wire       mac_tx_elecidle,
+    input  wire [1:0] PowerDown,
+    input  wire       TxElecIdle,
+
+    // PIPE command and MAC-facing local status.
+    output reg        TxDetectRx,
+    output reg        loopback_mode,
+    output wire       mac_loopback_active
+);
+
+    localparam [1:0] P0 = 2'b00;
+
+    wire loopback_request_valid;
+
+    // Original wrapper condition: P0, active transmitter, no other PHY
+    // operation starting. When mac_tx_elecidle rises, this becomes false
+    // immediately and the registered command clears on the next PCLK edge.
+    assign loopback_request_valid =
+        controller_idle &&
+        !starting_operation &&
+        mac_loopback &&
+        (PowerDown == P0) &&
+        !mac_tx_elecidle;
+
+    // This is the local wrapper's active indication, not a separate PHY
+    // acknowledgment. There is no loopback_done or PhyStatus handshake.
+    assign mac_loopback_active = loopback_mode && !TxElecIdle;
+
+    // Standalone form of the loopback portion of the shared TxDetectRx
+    // owner. In the full wrapper, the same registers also handle P1
+    // receiver-detection launch, completion, and timeout.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            TxDetectRx   <= 1'b0;
+            loopback_mode <= 1'b0;
+        end else if (controller_fault || operation_timed_out) begin
+            TxDetectRx   <= 1'b0;
+            loopback_mode <= 1'b0;
+        end else if (controller_idle && !starting_operation) begin
+            TxDetectRx   <= loopback_request_valid;
+            loopback_mode <= loopback_request_valid;
+        end
+        // During startup or an acknowledged PHY operation, hold values.
+    end
+
+endmodule

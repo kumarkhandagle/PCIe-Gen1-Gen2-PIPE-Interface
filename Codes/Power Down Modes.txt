@@ -1,0 +1,173 @@
+`timescale 1ns/1ps
+
+// Standalone power-state controller extracted from pcie_pipe_mac_if_v3.
+// Scope: Gen1/Gen2, x1, P0/P0s/P1. P2 is intentionally unsupported.
+//
+// The LTSSM supplies mac_powerdown and prepares TxElecIdle before asking
+// to enter P0s or P1. This module does not generate EIOS or TxElecIdle.
+// TxElecIdle is the registered PIPE command already presented to the PHY.
+//
+// In the full wrapper, a shared arbiter gives eligible rate requests priority
+// over eligible power requests, then receiver detection. Here power is the
+// only operation, so the state machine can stand alone for teaching.
+module pcie_pipe_power_controller #(
+    parameter integer PHY_TIMEOUT_CYCLES = 4096
+) (
+    input  wire       pclk,
+    input  wire       reset_n,
+
+    // MAC/LTSSM request and conditions supplied by the surrounding wrapper.
+    input  wire [1:0] mac_powerdown,
+    input  wire       TxElecIdle,
+    input  wire       loopback_mode,
+
+    // Completion of the requested power transition from the PHY.
+    input  wire       PhyStatus,
+
+    // PIPE command and MAC-side result.
+    output reg  [1:0] PowerDown,
+    output reg        power_done,
+    output wire       power_busy,
+    output wire       phy_initialized,
+    output reg        phy_timeout,
+    output wire       request_blocked,
+    output reg  [2:0] request_blocked_reason
+);
+
+    localparam [1:0] P0  = 2'b00;
+    localparam [1:0] P0S = 2'b01;
+    localparam [1:0] P1  = 2'b10;
+    localparam [1:0] P2  = 2'b11;
+
+    localparam [1:0] ST_RESET = 2'd0;
+    localparam [1:0] ST_IDLE  = 2'd1;
+    localparam [1:0] ST_WAIT  = 2'd2;
+    localparam [1:0] ST_FAULT = 2'd3;
+
+    localparam [2:0] BLK_NONE        = 3'd0;
+    localparam [2:0] BLK_ILLEGAL_PWR = 3'd1;
+    localparam [2:0] BLK_TX_NOT_IDLE = 3'd2;
+    localparam [2:0] BLK_LOOPBACK    = 3'd4;
+
+    reg [1:0]  state;
+    reg [31:0] timeout_counter;
+
+    wire power_change_needed;
+    wire power_change_allowed;
+    wire start_power_operation;
+    wire finish_power_operation;
+    wire power_operation_timed_out;
+
+    // Only adjacent transitions through P0 are accepted.
+    function legal_power_transition;
+        input [1:0] current_power;
+        input [1:0] requested_power;
+        begin
+            case (current_power)
+                P0:      legal_power_transition =
+                             (requested_power == P0S) ||
+                             (requested_power == P1);
+                P0S:     legal_power_transition = (requested_power == P0);
+                P1:      legal_power_transition = (requested_power == P0);
+                default: legal_power_transition = 1'b0;
+            endcase
+        end
+    endfunction
+
+    assign power_change_needed = (mac_powerdown != PowerDown);
+
+    // Entering a lower power state requires the TX electrical-idle command.
+    // Returning to P0 has no such prerequisite in the source wrapper.
+    assign power_change_allowed =
+        legal_power_transition(PowerDown, mac_powerdown) &&
+        ((mac_powerdown == P0) || TxElecIdle) &&
+        !loopback_mode;
+
+    assign start_power_operation =
+        (state == ST_IDLE) &&
+        power_change_needed &&
+        power_change_allowed;
+
+    assign finish_power_operation = (state == ST_WAIT) && PhyStatus;
+
+    // A simultaneous PhyStatus and timeout threshold completes successfully.
+    assign power_operation_timed_out =
+        (state == ST_WAIT) &&
+        !PhyStatus &&
+        (timeout_counter >= (PHY_TIMEOUT_CYCLES - 1));
+
+    assign power_busy = (state == ST_WAIT) || start_power_operation;
+    assign phy_initialized = (state == ST_IDLE) || (state == ST_WAIT);
+    assign request_blocked = (request_blocked_reason != BLK_NONE);
+
+    always @* begin
+        request_blocked_reason = BLK_NONE;
+
+        if ((state == ST_IDLE) &&
+            power_change_needed &&
+            !power_change_allowed) begin
+            if (!legal_power_transition(PowerDown, mac_powerdown))
+                request_blocked_reason = BLK_ILLEGAL_PWR;
+            else if (loopback_mode)
+                request_blocked_reason = BLK_LOOPBACK;
+            else
+                request_blocked_reason = BLK_TX_NOT_IDLE;
+        end
+    end
+
+    // PowerDown changes when the operation launches. The registered done
+    // pulse is produced only when the PHY subsequently asserts PhyStatus.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            state           <= ST_RESET;
+            PowerDown       <= P1;
+            power_done      <= 1'b0;
+            phy_timeout     <= 1'b0;
+            timeout_counter <= 32'd0;
+        end else begin
+            power_done <= 1'b0;
+
+            case (state)
+                ST_RESET: begin
+                    // Preserve the source wrapper's startup assumption:
+                    // a sampled low PhyStatus means startup is complete.
+                    if (!PhyStatus)
+                        state <= ST_IDLE;
+                end
+
+                ST_IDLE: begin
+                    timeout_counter <= 32'd0;
+                    if (start_power_operation) begin
+                        PowerDown <= mac_powerdown;
+                        state <= ST_WAIT;
+                    end
+                end
+
+                ST_WAIT: begin
+                    if (finish_power_operation) begin
+                        power_done <= 1'b1;
+                        timeout_counter <= 32'd0;
+                        state <= ST_IDLE;
+                    end else if (power_operation_timed_out) begin
+                        phy_timeout <= 1'b1;
+                        state <= ST_FAULT;
+                    end else begin
+                        timeout_counter <= timeout_counter + 32'd1;
+                    end
+                end
+
+                ST_FAULT: state <= ST_FAULT; // Reset is the only recovery.
+
+                default: state <= ST_FAULT;
+            endcase
+        end
+    end
+
+    initial begin
+        if (PHY_TIMEOUT_CYCLES < 1) begin
+            $display("FATAL: PHY_TIMEOUT_CYCLES must be at least 1");
+            $finish;
+        end
+    end
+
+endmodule

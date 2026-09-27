@@ -1,0 +1,976 @@
+`timescale 1ns/1ps
+
+// ============================================================================
+// pcie_pipe_mac_if_v3.v -- OPERATION-GROUPED EDITION
+// ============================================================================
+// Reorganized from the supplied pcie_pipe_mac_if_v3 implementation.
+// Module name, parameter defaults, port order and intended cycle behavior are
+// preserved. This is a readability refactor, not a PIPE-specification update.
+//
+// Original scope: Gen1/Gen2, one lane, 8-bit data, PHY-generated PCLK,
+// P0/P0s/P1, receiver detection and loopback control. P2, Gen3+, multiple
+// lanes and dynamic width changes remain outside this wrapper's scope.
+//
+// Reading map
+// -----------
+//  01  Shared encodings and controller signals
+//  02  Reset connection and initialization status
+//  03  Power-state change: request -> permission -> command -> completion
+//  04  Rate change: request -> standby/de-emphasis -> command -> completion
+//  05  Receiver detection: request bookkeeping -> permission -> result
+//  06  Loopback: request qualification and local active indication
+//  07  Shared arbiter and completion-event decoding
+//  08  Shared startup / idle / wait / fault controller
+//  09  Shared TxDetectRx ownership: detection versus loopback
+//  10  Shared blocked-request reporting
+//  11  TX electrical idle, data path and general transmitter controls
+//  12  RX electrical-idle synchronization/filtering, data and status
+//  13  Original parameter checks
+//
+// The source order is a READING order, not an execution order. Clocked blocks
+// sample pre-edge values together and update registers with nonblocking <=.
+//
+// Shared hardware must remain shared:
+//   * One arbiter/controller serializes power, rate and detection operations.
+//   * One clocked block owns TxDetectRx and loopback_mode.
+//   * Loopback does not enter ST_WAIT and has no PhyStatus completion pulse.
+//
+// Important inherited behavior:
+//   * Requests do not automatically prepare power, idle or RX standby.
+//   * Rate has priority over power, then detection, among eligible operations.
+//   * Timeout counts active PCLK edges; it cannot measure a stopped clock.
+//   * The source's startup, status and filtering assumptions are unchanged.
+// ============================================================================
+
+module pcie_pipe_mac_if_v3 #(
+
+    // Number of consecutive synchronized PCLK samples required before
+    // mac_rx_elecidle changes.
+    //
+    // Select this value using the target PHY's requirements.
+    parameter integer RX_EI_FILTER_CYCLES = 32,
+
+    // Maximum number of active PCLK cycles to wait for PhyStatus.
+    parameter integer PHY_TIMEOUT_CYCLES = 4096
+
+) (
+
+    // ========================================================================
+    // Clock and reset
+    // ========================================================================
+
+    input  wire        pclk,
+    input  wire        reset_n,
+
+    // Connect to the PHY PIPE Reset# input.
+    output wire        pipe_reset_n,
+
+
+    // ========================================================================
+    // MAC transmit inputs
+    // ========================================================================
+
+    input  wire [7:0]  mac_tx_data,
+    input  wire        mac_tx_datak,
+    input  wire        mac_tx_elecidle,
+    input  wire        mac_tx_compliance,
+
+    // Request PHY loopback.
+    //
+    // Loopback is allowed only in P0 while the transmitter is active.
+    // While loopback is active, TxDetectRx is owned by the loopback request.
+    input  wire        mac_loopback,
+
+    output wire        mac_loopback_active,
+
+
+    // ========================================================================
+    // MAC configuration inputs
+    // ========================================================================
+
+    input  wire        mac_rx_polarity,
+
+    // Receiver standby is required for a rate change performed in P0.
+    input  wire        mac_rx_standby,
+
+    // PHY acknowledgement that the receiver entered standby.
+    output wire        mac_rx_standby_status,
+
+    // Gen2:
+    //   0 = -6 dB
+    //   1 = -3.5 dB
+    //
+    // Gen1 forces TxDeemph to 1.
+    input  wire        mac_tx_deemph,
+
+    input  wire [2:0]  mac_tx_margin,
+    input  wire        mac_tx_swing,
+
+
+    // ========================================================================
+    // MAC requests
+    // ========================================================================
+
+    // PowerDown:
+    //
+    //   2'b00 = P0
+    //   2'b01 = P0s
+    //   2'b10 = P1
+    //   2'b11 = P2, unsupported
+    input  wire [1:0]  mac_powerdown,
+
+    // Rate:
+    //
+    //   0 = Gen1
+    //   1 = Gen2
+    input  wire        mac_rate,
+
+    // Receiver-detection request.
+    //
+    // Contract:
+    //
+    //   1. Assert mac_detect_req.
+    //   2. Keep it asserted until detect_done.
+    //   3. Deasserting it before launch cancels the queued request.
+    //
+    // A one-cycle request received while the wrapper is busy is not retained.
+    input  wire        mac_detect_req,
+
+
+    // ========================================================================
+    // MAC operation status
+    // ========================================================================
+
+    // One-PCLK completion pulses.
+    output reg         power_done,
+    output reg         rate_done,
+    output reg         detect_done,
+
+    // Held result from the most recent receiver detection.
+    output reg         detect_rx_present,
+
+    // Sticky PHY timeout indication.
+    output reg         phy_timeout,
+
+    // Combinational indication that an otherwise outstanding request cannot
+    // currently start.
+    output wire        request_blocked,
+    output wire [2:0]  request_blocked_reason,
+
+    // High while an operation is active, including its launch cycle.
+    output wire        phy_busy,
+
+    // High after PHY startup and before a timeout fault.
+    output wire        phy_initialized,
+
+
+    // ========================================================================
+    // Receive information delivered to the MAC
+    // ========================================================================
+
+    output wire [7:0]  mac_rx_data,
+    output wire        mac_rx_datak,
+    output wire        mac_rx_valid,
+
+    // Synchronized and filtered RxElecIdle.
+    output reg         mac_rx_elecidle,
+
+    output wire [2:0]  mac_rx_status,
+
+    // Decoded RxStatus indications.
+    output wire        rx_skp_added,
+    output wire        rx_skp_removed,
+    output wire        rx_decode_error,
+    output wire        rx_elastic_overflow,
+    output wire        rx_elastic_underflow,
+    output wire        rx_disparity_error,
+
+
+    // ========================================================================
+    // PIPE outputs to the PHY
+    // ========================================================================
+
+    output reg  [7:0]  TxData,
+    output reg         TxDataK,
+    output reg         TxElecIdle,
+    output reg         TxCompliance,
+
+    // Dual-purpose signal:
+    //
+    //   P1 = receiver detection
+    //   P0 = loopback request
+    output reg         TxDetectRx,
+
+    output reg  [1:0]  PowerDown,
+    output reg         Rate,
+    output reg         RxStandby,
+
+    output reg         TxDeemph,
+    output reg  [2:0]  TxMargin,
+    output reg         TxSwing,
+
+    output wire        RxPolarity,
+
+
+    // ========================================================================
+    // PIPE inputs from the PHY
+    // ========================================================================
+
+    input  wire [7:0]  RxData,
+    input  wire        RxDataK,
+    input  wire        RxValid,
+
+    // Asynchronous to PCLK.
+    input  wire        RxElecIdle,
+
+    input  wire [2:0]  RxStatus,
+    input  wire        RxStandbyStatus,
+    input  wire        PhyStatus
+
+);
+
+
+    // ========================================================================
+    // 01. SHARED ENCODINGS AND CONTROLLER SIGNALS
+    // ========================================================================
+
+    // ========================================================================
+    // PIPE power-state encodings
+    // ========================================================================
+
+    localparam [1:0] P0  = 2'b00;
+    localparam [1:0] P0S = 2'b01;
+    localparam [1:0] P1  = 2'b10;
+    localparam [1:0] P2  = 2'b11;
+
+
+    // ========================================================================
+    // PIPE RxStatus encodings
+    // ========================================================================
+
+    localparam [2:0] RXST_OK            = 3'b000;
+    localparam [2:0] RXST_SKP_ADDED     = 3'b001;
+    localparam [2:0] RXST_SKP_REMOVED   = 3'b010;
+    localparam [2:0] RXST_RX_DETECTED   = 3'b011;
+    localparam [2:0] RXST_DECODE_ERROR  = 3'b100;
+    localparam [2:0] RXST_ELASTIC_OVF   = 3'b101;
+    localparam [2:0] RXST_ELASTIC_UND   = 3'b110;
+    localparam [2:0] RXST_DISPARITY_ERR = 3'b111;
+
+
+    // ========================================================================
+    // Controller-state encodings
+    // ========================================================================
+
+    localparam [2:0] ST_RESET = 3'd0;
+    localparam [2:0] ST_IDLE  = 3'd1;
+    localparam [2:0] ST_WAIT  = 3'd2;
+    localparam [2:0] ST_FAULT = 3'd3;
+
+
+    // ========================================================================
+    // Active-operation encodings
+    // ========================================================================
+
+    localparam [1:0] OP_NONE   = 2'd0;
+    localparam [1:0] OP_POWER  = 2'd1;
+    localparam [1:0] OP_RATE   = 2'd2;
+    localparam [1:0] OP_DETECT = 2'd3;
+
+
+    // ========================================================================
+    // Blocked-request reason encodings
+    // ========================================================================
+
+    localparam [2:0] BLK_NONE            = 3'd0;
+    localparam [2:0] BLK_ILLEGAL_PWR     = 3'd1;
+    localparam [2:0] BLK_TX_NOT_IDLE     = 3'd2;
+    localparam [2:0] BLK_WRONG_PWR_STATE = 3'd3;
+    localparam [2:0] BLK_LOOPBACK        = 3'd4;
+    localparam [2:0] BLK_RX_NOT_STANDBY  = 3'd5;
+
+
+    // Shared controller state. These are NOT PHY power-state registers.
+    reg [2:0]  state;
+    reg [1:0]  active_operation;
+    reg [31:0] timeout_counter;
+
+    // Shared TxDetectRx ownership flag; written only in section 09.
+    reg loopback_mode;
+
+    // Launch events: combinational, not extra pipeline registers.
+    wire start_power_operation;
+    wire start_rate_operation;
+    wire start_detect_operation;
+    wire starting_operation;
+
+    // Completion/timeout events describe the current ST_WAIT cycle.
+    reg  operation_acknowledged;
+    reg  operation_timed_out;
+    wire finish_power_operation;
+    wire finish_rate_operation;
+    wire finish_detect_operation;
+
+    // ========================================================================
+    // 02. RESET CONNECTION AND INITIALIZATION STATUS
+    // ========================================================================
+
+    assign pipe_reset_n = reset_n;
+
+    // Startup/fault are not initialized; an in-flight operation is initialized.
+    assign phy_initialized =
+        (state == ST_IDLE) ||
+        (state == ST_WAIT);
+
+    // ========================================================================
+    // 03. POWER-STATE CHANGE
+    // ========================================================================
+
+    // 03A. Supported transitions in this wrapper:
+    //      P0 -> P0s, P0s -> P0, P0 -> P1, P1 -> P0.
+    //      P0s <-> P1 must go through P0; transitions involving P2 are rejected.
+
+    function legal_power_transition;
+
+        input [1:0] current_power;
+        input [1:0] requested_power;
+
+        begin
+            case (current_power)
+
+                P0: begin
+                    legal_power_transition =
+                        (requested_power == P0S) ||
+                        (requested_power == P1);
+                end
+
+                P0S: begin
+                    legal_power_transition =
+                        (requested_power == P0);
+                end
+
+                P1: begin
+                    legal_power_transition =
+                        (requested_power == P0);
+                end
+
+                default: begin
+                    legal_power_transition = 1'b0;
+                end
+
+            endcase
+        end
+
+    endfunction
+
+    // 03B. Is a change requested, and may it start?
+    wire power_change_needed;
+    wire power_change_allowed;
+    reg [2:0] power_blocked_reason;
+
+    assign power_change_needed = (mac_powerdown != PowerDown);
+
+    assign power_change_allowed =
+        legal_power_transition(PowerDown, mac_powerdown) &&
+        ((mac_powerdown == P0) || TxElecIdle) &&
+        !loopback_mode;
+
+    // 03C. Explain this operation's blocked request.
+    always @* begin
+        power_blocked_reason = BLK_NONE;
+
+        if (power_change_needed && !power_change_allowed) begin
+            if (!legal_power_transition(PowerDown, mac_powerdown))
+                power_blocked_reason = BLK_ILLEGAL_PWR;
+            else if (loopback_mode)
+                power_blocked_reason = BLK_LOOPBACK;
+            else
+                power_blocked_reason = BLK_TX_NOT_IDLE;
+        end
+    end
+
+    // 03D. Own the PHY power command and the one-cycle completion pulse.
+    // PowerDown changes at launch; power_done follows acknowledgment later.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            PowerDown <= P1;
+            power_done <= 1'b0;
+        end else begin
+            power_done <= 1'b0;
+
+            if (start_power_operation)
+                PowerDown <= mac_powerdown;
+
+            if (finish_power_operation)
+                power_done <= 1'b1;
+        end
+    end
+
+    // ========================================================================
+    // 04. RATE CHANGE, RECEIVER STANDBY AND DE-EMPHASIS
+    // ========================================================================
+
+    // 04A. Is a rate change requested, and may it start?
+    wire rate_change_needed;
+    wire rate_change_allowed;
+    reg [2:0] rate_blocked_reason;
+
+    assign rate_change_needed = (mac_rate != Rate);
+
+    assign rate_change_allowed =
+        ((PowerDown == P0) || (PowerDown == P1)) &&
+        TxElecIdle &&
+        ((PowerDown != P0) || (RxStandby && RxStandbyStatus)) &&
+        !loopback_mode;
+
+    // 04B. Explain this operation's blocked request.
+    always @* begin
+        rate_blocked_reason = BLK_NONE;
+
+        if (rate_change_needed && !rate_change_allowed) begin
+            if (loopback_mode)
+                rate_blocked_reason = BLK_LOOPBACK;
+            else if ((PowerDown != P0) && (PowerDown != P1))
+                rate_blocked_reason = BLK_WRONG_PWR_STATE;
+            else if (!TxElecIdle)
+                rate_blocked_reason = BLK_TX_NOT_IDLE;
+            else
+                rate_blocked_reason = BLK_RX_NOT_STANDBY;
+        end
+    end
+
+    // 04C. Receiver standby is MAC-controlled, not automatically requested.
+    // Hold its registered command during launch and while awaiting PhyStatus.
+    assign mac_rx_standby_status = RxStandbyStatus;
+
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n)
+            RxStandby <= 1'b0;
+        else if ((state == ST_IDLE) && !starting_operation)
+            RxStandby <= mac_rx_standby;
+    end
+
+    // 04D. Preserve the original de-emphasis update timing.
+    // On the rate-launch edge, use the requested rate. On other idle-TX edges,
+    // use Rate. This is NOT an added pre-launch preparation cycle.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            TxDeemph <= 1'b1;
+        end else if (TxElecIdle) begin
+            if (start_rate_operation)
+                TxDeemph <= mac_rate ? mac_tx_deemph : 1'b1;
+            else
+                TxDeemph <= Rate ? mac_tx_deemph : 1'b1;
+        end
+    end
+
+    // 04E. Own the PHY rate command and the one-cycle completion pulse.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            Rate <= 1'b0;
+            rate_done <= 1'b0;
+        end else begin
+            rate_done <= 1'b0;
+
+            if (start_rate_operation)
+                Rate <= mac_rate;
+
+            if (finish_rate_operation)
+                rate_done <= 1'b1;
+        end
+    end
+
+    // ========================================================================
+    // 05. RECEIVER DETECTION
+    // ========================================================================
+
+    // 05A. Capture a rising request; retain it only while the MAC holds it high.
+    // A withdrawn request is canceled before launch, not after launch.
+    reg  detect_req_delayed;
+    reg  detect_pending;
+    wire detect_req_rising;
+    wire detect_allowed;
+    reg [2:0] detect_blocked_reason;
+
+    assign detect_req_rising = mac_detect_req && !detect_req_delayed;
+
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            detect_req_delayed <= 1'b0;
+            detect_pending <= 1'b0;
+        end else begin
+            detect_req_delayed <= mac_detect_req;
+
+            if (detect_req_rising)
+                detect_pending <= 1'b1;
+            else if (!mac_detect_req)
+                detect_pending <= 1'b0;
+
+            // Later nonblocking assignments retain the source's priority.
+            if (start_detect_operation)
+                detect_pending <= detect_req_rising;
+
+            if (state == ST_FAULT)
+                detect_pending <= 1'b0;
+        end
+    end
+
+    // 05B. Receiver detection can launch only in the existing P1/idle condition.
+    // This wrapper does not automatically move to P1 for the request.
+    assign detect_allowed =
+        (PowerDown == P1) &&
+        TxElecIdle &&
+        !loopback_mode;
+
+    // 05C. Explain this operation's blocked request.
+    always @* begin
+        detect_blocked_reason = BLK_NONE;
+
+        if (detect_pending && mac_detect_req && !detect_allowed) begin
+            if (loopback_mode)
+                detect_blocked_reason = BLK_LOOPBACK;
+            else if (PowerDown != P1)
+                detect_blocked_reason = BLK_WRONG_PWR_STATE;
+            else
+                detect_blocked_reason = BLK_TX_NOT_IDLE;
+        end
+    end
+
+    // 05D. Capture the result only when this detection operation completes.
+    // As in the source, only 3'b011 produces a true result; other codes give 0.
+    // The held result is not cleared simply because another detection starts.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            detect_done <= 1'b0;
+            detect_rx_present <= 1'b0;
+        end else begin
+            detect_done <= 1'b0;
+
+            if (finish_detect_operation) begin
+                detect_rx_present <= (RxStatus == RXST_RX_DETECTED);
+                detect_done <= 1'b1;
+            end
+        end
+    end
+
+    // 05E. TxDetectRx assertion/holding/clearing lives in section 09 because
+    //      detection and loopback must not independently drive that register.
+
+    // ========================================================================
+    // 06. LOOPBACK REQUEST AND LOCAL STATUS
+    // ========================================================================
+
+    wire loopback_request_valid;
+
+    // Unlike the acknowledged operations, loopback is level-controlled in IDLE.
+    // Use the current MAC idle request so loopback clears on the same edge
+    // that the MAC requests electrical idle, preserving the original behavior.
+    assign loopback_request_valid =
+        (state == ST_IDLE) &&
+        !starting_operation &&
+        mac_loopback &&
+        (PowerDown == P0) &&
+        !mac_tx_elecidle;
+
+    // Local command indication, not a separately acknowledged PHY status.
+    assign mac_loopback_active = loopback_mode && !TxElecIdle;
+
+    // The actual loopback_mode and TxDetectRx registers have one owner:
+    // section 09. There is no OP_LOOPBACK or loopback completion handshake.
+
+    // ========================================================================
+    // 07. SHARED ARBITER AND COMPLETION EVENTS
+    // ========================================================================
+
+    // Only one acknowledged operation may launch. Priority is among operations
+    // that can actually start: a blocked rate request does not block legal power.
+    assign start_rate_operation =
+        (state == ST_IDLE) &&
+        rate_change_needed &&
+        rate_change_allowed;
+
+    assign start_power_operation =
+        (state == ST_IDLE) &&
+        !start_rate_operation &&
+        power_change_needed &&
+        power_change_allowed;
+
+    assign start_detect_operation =
+        (state == ST_IDLE) &&
+        !start_rate_operation &&
+        !start_power_operation &&
+        detect_pending &&
+        mac_detect_req &&
+        detect_allowed;
+
+    assign starting_operation =
+        start_rate_operation ||
+        start_power_operation ||
+        start_detect_operation;
+
+    assign phy_busy = (state == ST_WAIT) || starting_operation;
+
+    // Reuse one completion/timeout decision across the separated owners.
+    // PhyStatus wins if acknowledgment and timeout threshold coincide.
+    // Defaults also preserve the source's procedural if behavior.
+    always @* begin
+        operation_acknowledged = 1'b0;
+        operation_timed_out = 1'b0;
+
+        case (state)
+            ST_WAIT: begin
+                if (PhyStatus)
+                    operation_acknowledged = 1'b1;
+                else if (timeout_counter >= (PHY_TIMEOUT_CYCLES - 1))
+                    operation_timed_out = 1'b1;
+            end
+            default: begin
+                operation_acknowledged = 1'b0;
+                operation_timed_out = 1'b0;
+            end
+        endcase
+    end
+
+    assign finish_power_operation =
+        operation_acknowledged && (active_operation == OP_POWER);
+
+    assign finish_rate_operation =
+        operation_acknowledged && (active_operation == OP_RATE);
+
+    assign finish_detect_operation =
+        operation_acknowledged && (active_operation == OP_DETECT);
+
+    // ========================================================================
+    // 08. SHARED STARTUP / IDLE / WAIT / FAULT CONTROLLER
+    // ========================================================================
+
+    // Own only sequencing, operation identity, timeout counting and fault status.
+    // Operation-specific command/result registers live in sections 03, 04, 05.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            state <= ST_RESET;
+            active_operation <= OP_NONE;
+            timeout_counter <= 32'd0;
+            phy_timeout <= 1'b0;
+        end else begin
+            case (state)
+                ST_RESET: begin
+                    // Inherited startup assumption: sampled low means ready.
+                    // No startup timeout or "previously saw high" flag is added.
+                    if (!PhyStatus)
+                        state <= ST_IDLE;
+                end
+
+                ST_IDLE: begin
+                    timeout_counter <= 32'd0;
+
+                    if (start_rate_operation) begin
+                        active_operation <= OP_RATE;
+                        state <= ST_WAIT;
+                    end else if (start_power_operation) begin
+                        active_operation <= OP_POWER;
+                        state <= ST_WAIT;
+                    end else if (start_detect_operation) begin
+                        active_operation <= OP_DETECT;
+                        state <= ST_WAIT;
+                    end
+                end
+
+                ST_WAIT: begin
+                    if (operation_acknowledged) begin
+                        active_operation <= OP_NONE;
+                        timeout_counter <= 32'd0;
+                        state <= ST_IDLE;
+                    end else if (operation_timed_out) begin
+                        phy_timeout <= 1'b1;
+                        active_operation <= OP_NONE;
+                        state <= ST_FAULT;
+                    end else begin
+                        timeout_counter <= timeout_counter + 32'd1;
+                    end
+                end
+
+                ST_FAULT: begin
+                    // Reset is the only exit. phy_timeout remains sticky.
+                    state <= ST_FAULT;
+                end
+
+                default: begin
+                    // Preserve the source: an invalid state enters FAULT but
+                    // does not independently set the phy_timeout register.
+                    state <= ST_FAULT;
+                end
+            endcase
+        end
+    end
+
+    // ========================================================================
+    // 09. SHARED TxDetectRx OWNER: DETECTION VERSUS LOOPBACK
+    // ========================================================================
+
+    // This is the ONLY clocked block assigning TxDetectRx and loopback_mode.
+    // P1 receiver detection and P0 loopback share the same PHY output.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            TxDetectRx <= 1'b0;
+            loopback_mode <= 1'b0;
+        end else begin
+            case (state)
+                ST_RESET: begin
+                    // Hold reset values during startup.
+                end
+
+                ST_IDLE: begin
+                    if (start_rate_operation) begin
+                        // A rate operation owns this launch cycle; hold here.
+                    end else if (start_power_operation) begin
+                        // A power operation owns this launch cycle; hold here.
+                    end else if (start_detect_operation) begin
+                        TxDetectRx <= 1'b1;
+                        loopback_mode <= 1'b0;
+                    end else begin
+                        TxDetectRx <= loopback_request_valid;
+                        loopback_mode <= loopback_request_valid;
+                    end
+                end
+
+                ST_WAIT: begin
+                    if (operation_acknowledged) begin
+                        if (finish_detect_operation)
+                            TxDetectRx <= 1'b0;
+                    end else if (operation_timed_out) begin
+                        TxDetectRx <= 1'b0;
+                        loopback_mode <= 1'b0;
+                    end
+                    // Otherwise hold: detection keeps TxDetectRx high.
+                end
+
+                ST_FAULT: begin
+                    TxDetectRx <= 1'b0;
+                    loopback_mode <= 1'b0;
+                end
+
+                default: begin
+                    TxDetectRx <= 1'b0;
+                    loopback_mode <= 1'b0;
+                end
+            endcase
+        end
+    end
+
+    // ========================================================================
+    // 10. SHARED BLOCKED-REQUEST REPORTING
+    // ========================================================================
+
+    reg [2:0] blocked_reason;
+
+    // Each operation computes its own reason beside its own preconditions.
+    // This block only chooses which reason to expose at the common output.
+    // Preserve the source's priority and suppression during launch/busy/startup.
+    always @* begin
+        blocked_reason = BLK_NONE;
+
+        if ((state == ST_IDLE) && !starting_operation) begin
+            if (rate_change_needed && !rate_change_allowed)
+                blocked_reason = rate_blocked_reason;
+            else if (power_change_needed && !power_change_allowed)
+                blocked_reason = power_blocked_reason;
+            else if (detect_pending && mac_detect_req && !detect_allowed)
+                blocked_reason = detect_blocked_reason;
+        end
+    end
+
+    assign request_blocked = (blocked_reason != BLK_NONE);
+    assign request_blocked_reason = blocked_reason;
+
+    // ========================================================================
+    // 11. TX ELECTRICAL IDLE, DATA PATH AND GENERAL CONTROLS
+    // ========================================================================
+
+    wire force_tx_idle;
+    wire effective_tx_idle;
+
+    // Shared safety override. The launch cycle is included deliberately.
+    assign force_tx_idle =
+        !phy_initialized ||
+        (PowerDown != P0) ||
+        (state == ST_WAIT) ||
+        starting_operation;
+
+    assign effective_tx_idle = mac_tx_elecidle || force_tx_idle;
+
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            TxData <= 8'h00;
+            TxDataK <= 1'b0;
+            TxElecIdle <= 1'b1;
+            TxCompliance <= 1'b0;
+        end else begin
+            TxElecIdle <= effective_tx_idle;
+
+            TxCompliance <=
+                mac_tx_compliance &&
+                (PowerDown == P0) &&
+                !effective_tx_idle;
+
+            if (effective_tx_idle) begin
+                TxData <= 8'h00;
+                TxDataK <= 1'b0;
+            end else begin
+                TxData <= mac_tx_data;
+                TxDataK <= mac_tx_datak;
+            end
+        end
+    end
+
+    // General transmitter controls, retained independently of rate sequencing.
+    // These continue following MAC inputs while the registered TX idle is high.
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            TxMargin <= 3'b000;
+            TxSwing <= 1'b0;
+        end else if (TxElecIdle) begin
+            TxMargin <= mac_tx_margin;
+            TxSwing <= mac_tx_swing;
+        end
+    end
+
+    // ========================================================================
+    // 12. RX SYNCHRONIZATION, DATA PATH AND STATUS DECODING
+    // ========================================================================
+
+    assign RxPolarity = mac_rx_polarity;
+
+    // 12A. Two synchronization stages followed by the original sample filter.
+    // The default remains 32. Zero bypasses filtering, not synchronization.
+    reg       rx_ei_meta;
+    reg       rx_ei_sync;
+    reg [7:0] rx_ei_counter;
+
+    always @(posedge pclk or negedge reset_n) begin
+        if (!reset_n) begin
+            rx_ei_meta      <= 1'b1;
+            rx_ei_sync      <= 1'b1;
+            rx_ei_counter   <= 8'd0;
+            mac_rx_elecidle <= 1'b1;
+        end else begin
+            // Two-stage synchronization.
+            rx_ei_meta <= RxElecIdle;
+            rx_ei_sync <= rx_ei_meta;
+
+            if (rx_ei_sync == mac_rx_elecidle) begin
+                // No change is waiting to be accepted.
+                rx_ei_counter <= 8'd0;
+            end else if (RX_EI_FILTER_CYCLES == 0) begin
+                // Bypass filtering; the synchronizer remains in the path.
+                mac_rx_elecidle <= rx_ei_sync;
+                rx_ei_counter   <= 8'd0;
+            end else if (
+                rx_ei_counter >= (RX_EI_FILTER_CYCLES - 1)
+            ) begin
+                // Accept the value after the configured consecutive samples.
+                mac_rx_elecidle <= rx_ei_sync;
+                rx_ei_counter   <= 8'd0;
+            end else begin
+                rx_ei_counter <= rx_ei_counter + 8'd1;
+            end
+        end
+    end
+
+    // 12B. Raw RX data/status forwarding and qualified decoded status flags.
+    // mac_rx_valid is passed through; it is not newly gated by this refactor.
+    assign mac_rx_data   = RxData;
+    assign mac_rx_datak  = RxDataK;
+    assign mac_rx_valid  = RxValid;
+    assign mac_rx_status = RxStatus;
+
+
+    // ========================================================================
+    // RxStatus decoding
+    // ========================================================================
+
+    // RxStatus is decoded only when:
+    //
+    //   * The PHY is ready.
+    //   * The receiver is active.
+    //   * RxValid is asserted.
+    //   * Receiver detection is not in progress.
+    //
+    // P0s keeps the receiver active because L0s is directional.
+
+    wire rx_receiver_active;
+    wire detect_in_progress;
+    wire rx_status_is_normal;
+
+
+    assign rx_receiver_active =
+        (PowerDown == P0) ||
+        (PowerDown == P0S);
+
+
+    assign detect_in_progress =
+        (state == ST_WAIT) &&
+        (active_operation == OP_DETECT);
+
+
+    assign rx_status_is_normal =
+        phy_initialized &&
+        rx_receiver_active &&
+        RxValid &&
+        !detect_in_progress;
+
+
+    assign rx_skp_added =
+        rx_status_is_normal &&
+        (RxStatus == RXST_SKP_ADDED);
+
+
+    assign rx_skp_removed =
+        rx_status_is_normal &&
+        (RxStatus == RXST_SKP_REMOVED);
+
+
+    assign rx_decode_error =
+        rx_status_is_normal &&
+        (RxStatus == RXST_DECODE_ERROR);
+
+
+    assign rx_elastic_overflow =
+        rx_status_is_normal &&
+        (RxStatus == RXST_ELASTIC_OVF);
+
+
+    assign rx_elastic_underflow =
+        rx_status_is_normal &&
+        (RxStatus == RXST_ELASTIC_UND);
+
+
+    assign rx_disparity_error =
+        rx_status_is_normal &&
+        (RxStatus == RXST_DISPARITY_ERR);
+
+    // ========================================================================
+    // 13. ORIGINAL PARAMETER CHECKS
+    // ========================================================================
+
+    initial begin
+        // Preserve the original check exactly: negative filter values are not
+        // rejected by it. Parameter-policy changes are outside this refactor.
+        if (RX_EI_FILTER_CYCLES > 255) begin
+            $display(
+                "FATAL: RX_EI_FILTER_CYCLES must be 0 to 255; value is %0d",
+                RX_EI_FILTER_CYCLES
+            );
+            $finish;
+        end
+
+        if (PHY_TIMEOUT_CYCLES < 1) begin
+            $display(
+                "FATAL: PHY_TIMEOUT_CYCLES must be at least 1; value is %0d",
+                PHY_TIMEOUT_CYCLES
+            );
+            $finish;
+        end
+    end
+
+endmodule
